@@ -120,21 +120,15 @@ int main()
         die("connect");
     }
 
-    // multiple requests
-    int32_t err = query(fd, "hello1");
-    if (err)
+    for (int i = 0; i < 100; ++i)
     {
-        goto L_DONE;
-    }
-    err = query(fd, "hello2");
-    if (err)
-    {
-        goto L_DONE;
-    }
-    err = query(fd, "hello3");
-    if (err)
-    {
-        goto L_DONE;
+        char message[16];
+        snprintf(message, sizeof(message), "hello%d", i + 1);
+        int32_t err = query(fd, message);
+        if (err)
+        {
+            goto L_DONE;
+        }
     }
 
 L_DONE:
