@@ -260,6 +260,7 @@ static std::string http_response(int code, const std::string &json_body)
 
 static std::string handle_http_request(const std::string &request)
 {
+    fprintf(stderr, "Received HTTP request:\n%s\n", request.c_str());
     // Split header and body
     size_t header_end = request.find("\r\n\r\n");
     if (header_end == std::string::npos)
@@ -1111,7 +1112,7 @@ int main()
     // bind
     struct sockaddr_in addr = {};
     addr.sin_family = AF_INET;
-    addr.sin_port = ntohs(1234);
+    addr.sin_port = ntohs(7171);     // changed port: was 1234
     addr.sin_addr.s_addr = ntohl(0); // wildcard address 0.0.0.0
     int rv = bind(fd, (const sockaddr *)&addr, sizeof(addr));
     if (rv)
