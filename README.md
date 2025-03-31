@@ -61,10 +61,10 @@ docker stop redis-server
 docker login
 
 # Tag your image
-docker tag redis-server yourusername/redis_cpp:latest
+docker tag redis-server deysandip301/redis_cpp:latest
 
 # Push to Docker Hub
-docker push yourusername/redis_cpp:latest
+docker push deysandip301/redis_cpp:latest
 ```
 
 If you encounter DNS issues with Docker Hub, check your network/DNS settings:
