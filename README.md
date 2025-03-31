@@ -137,6 +137,9 @@ Response:
 ### 1. Memory Management
 
 - **LRU Eviction**: Automatically evicts least recently used keys when memory pressure increases
+- **Memory-Aware Eviction**: Monitors system memory usage and triggers proactive eviction when usage exceeds 70%
+- **Adaptive Eviction Strategy**: Adjusts eviction percentage based on memory pressure (10-40%)
+- **Size-Based Prioritization**: Under high memory pressure, prioritizes evicting larger entries first
 - **Efficient Data Structures**: Custom AVL tree and hashtable implementations for O(log n) operations
 - **Memory Pooling**: Reuses memory allocations to reduce fragmentation
 
@@ -174,7 +177,10 @@ Response:
 
 Adjust these parameters in the source code based on your workload:
 
-- `MAX_KEYS` (default: 25000): Maximum number of keys before eviction
+- `MAX_KEYS` (default: 25000): Maximum number of keys before count-based eviction
+- `MEM_EVICTION_THRESHOLD` (default: 0.70): Memory usage threshold for triggering eviction
+- `MEM_HIGH_WATER` (default: 0.85): Threshold for aggressive eviction
+- `MEM_CRITICAL` (default: 0.95): Threshold for emergency eviction
 - `MAX_ACTIVE_CONNS` (default: 8000): Maximum simultaneous connections
 - `MAX_CONN_PER_SEC` (default: 1000): Rate limit for new connections
 - `k_idle_timeout_ms` (default: 60000): Idle connection timeout in milliseconds

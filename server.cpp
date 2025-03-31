@@ -16,6 +16,8 @@
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <signal.h> // added for SIGPIPE
+#include <sys/resource.h>
+#include <iostream>
 // C++
 #include <string>
 #include <vector>
@@ -213,6 +215,23 @@ const size_t k_max_msg = 32 << 20; // likely larger than the kernel buffer
 
 // Define maximum allowed keys before eviction.
 static const size_t MAX_KEYS = 25000;
+static const double MEM_EVICTION_THRESHOLD = 0.70; // Evict at 70% memory usage
+static const double MEM_HIGH_WATER = 0.85;         // Aggressive eviction at 85%
+static const double MEM_CRITICAL = 0.95;           // Emergency eviction at 95%
+
+// Add function to get current memory usage
+static double get_memory_usage()
+{
+    struct rusage usage;
+    if (getrusage(RUSAGE_SELF, &usage) == 0)
+    {
+        // Get maxrss (resident set size) in KB, convert to fraction of system memory
+        long total_memory = sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGESIZE) / 1024;
+        double usage_fraction = static_cast<double>(usage.ru_maxrss) / total_memory;
+        return usage_fraction;
+    }
+    return 0.0; // On error, assume low memory usage
+}
 
 // Set idle timeout and connection limits
 const uint64_t k_idle_timeout_ms = 60 * 1000; // 60 seconds (was 5 seconds)
@@ -260,9 +279,37 @@ static bool hnode_same(HNode *node, HNode *key);
 static void evict_keys()
 {
     size_t current = hm_size(&g_data.db);
-    if (current <= MAX_KEYS)
+    double mem_usage = get_memory_usage();
+
+    // Skip if we're under all thresholds
+    if (current <= MAX_KEYS && mem_usage < MEM_EVICTION_THRESHOLD)
+    {
         return;
-    size_t num_to_evict = current / 10; // evict 10%
+    }
+
+    // Determine percentage to evict based on memory pressure
+    double evict_percentage = 0.10; // Default: evict 10%
+
+    if (mem_usage >= MEM_CRITICAL)
+    {
+        evict_percentage = 0.40; // Emergency: evict 40%
+        fprintf(stderr, "CRITICAL MEMORY USAGE (%.1f%%): Evicting %.1f%% of keys\n",
+                mem_usage * 100, evict_percentage * 100);
+    }
+    else if (mem_usage >= MEM_HIGH_WATER)
+    {
+        evict_percentage = 0.25; // Heavy pressure: evict 25%
+        fprintf(stderr, "HIGH MEMORY USAGE (%.1f%%): Evicting %.1f%% of keys\n",
+                mem_usage * 100, evict_percentage * 100);
+    }
+    else if (mem_usage >= MEM_EVICTION_THRESHOLD)
+    {
+        evict_percentage = 0.15; // Moderate pressure: evict 15%
+        fprintf(stderr, "MEMORY THRESHOLD EXCEEDED (%.1f%%): Evicting %.1f%% of keys\n",
+                mem_usage * 100, evict_percentage * 100);
+    }
+
+    size_t num_to_evict = std::max(size_t(current * evict_percentage), size_t(1));
     std::vector<Entry *> candidates;
     candidates.reserve(current);
 
@@ -276,19 +323,48 @@ static void evict_keys()
     };
     hm_foreach(&g_data.db, collect_cb, &candidates);
 
-    // Sort candidates by last_access (oldest first).
-    std::sort(candidates.begin(), candidates.end(), [](Entry *a, Entry *b)
-              { return a->last_access < b->last_access; });
+    // Sort candidates - enhance sorting to favor evicting larger entries first when under memory pressure
+    if (mem_usage >= MEM_HIGH_WATER)
+    {
+        // Under high memory pressure, prioritize evicting larger entries (strings)
+        std::sort(candidates.begin(), candidates.end(), [](Entry *a, Entry *b)
+                  {
+            // First prioritize by type - string entries can be large
+            if (a->type == T_STR && b->type != T_STR) return true;
+            if (a->type != T_STR && b->type == T_STR) return false;
+            
+            // For strings, prioritize larger strings
+            if (a->type == T_STR && b->type == T_STR) {
+                if (a->str.size() != b->str.size())
+                    return a->str.size() > b->str.size();
+            }
+            
+            // Fall back to LRU for ties or non-string types
+            return a->last_access < b->last_access; });
+    }
+    else
+    {
+        // Standard LRU eviction for normal conditions
+        std::sort(candidates.begin(), candidates.end(), [](Entry *a, Entry *b)
+                  { return a->last_access < b->last_access; });
+    }
 
     for (size_t i = 0; i < num_to_evict && i < candidates.size(); i++)
     {
         Entry *ent = candidates[i];
-        // Use forward-declared hnode_same
         HNode *node = hm_delete(&g_data.db, &ent->node, &hnode_same);
         if (node)
         {
             entry_del(ent);
         }
+    }
+
+    // Report current memory status after eviction
+    if (mem_usage >= MEM_EVICTION_THRESHOLD)
+    {
+        double new_usage = get_memory_usage();
+        fprintf(stderr, "After eviction: Memory usage %.1f%%, Keys: %zu\n",
+                new_usage * 100, hm_size(&g_data.db));
     }
 }
 
@@ -495,6 +571,14 @@ static void do_get(std::vector<std::string> &cmd, Buffer &out)
 
 static void do_set(std::vector<std::string> &cmd, Buffer &out)
 {
+    // Check memory usage at beginning of operation
+    double mem_usage = get_memory_usage();
+    if (mem_usage >= MEM_CRITICAL)
+    {
+        // Critical memory state, force eviction before adding any keys
+        evict_keys();
+    }
+
     LookupKey key;
     key.key.swap(cmd[1]);
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
@@ -513,6 +597,12 @@ static void do_set(std::vector<std::string> &cmd, Buffer &out)
     }
     else
     {
+        // For large values, check if we're near threshold and proactively evict
+        if (cmd[2].size() > 1024 && mem_usage >= MEM_EVICTION_THRESHOLD * 0.9)
+        {
+            evict_keys(); // Proactive eviction for large values
+        }
+
         Entry *ent = entry_new(T_STR);
         ent->key.swap(key.key);
         ent->node.hcode = key.node.hcode;
@@ -1239,6 +1329,9 @@ int main()
         die("listen()");
     }
 
+    // Add a counter for memory check frequency
+    size_t loop_counter = 0;
+
     // the event loop
     std::vector<struct pollfd> poll_args;
     while (true)
@@ -1337,6 +1430,21 @@ int main()
             if (conn->want_close)
             {
                 conn_destroy(conn);
+            }
+        }
+
+        // Periodically check memory usage (every 100 iterations)
+        if (++loop_counter % 100 == 0)
+        {
+            double mem_usage = get_memory_usage();
+            if (mem_usage >= MEM_EVICTION_THRESHOLD)
+            {
+                evict_keys(); // Proactive eviction based on memory usage
+            }
+            // Reset counter to prevent overflow
+            if (loop_counter > 10000)
+            {
+                loop_counter = 0;
             }
         }
 
