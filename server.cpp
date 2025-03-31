@@ -14,6 +14,8 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <signal.h> // added for SIGPIPE
 // C++
 #include <string>
 #include <vector>
@@ -65,6 +67,8 @@ struct Entry
     // one of the following
     std::string str;
     ZSet zset;
+
+    uint64_t last_access = 0; // new: timestamp of last access for eviction
 };
 
 static Entry *entry_new(uint32_t type)
@@ -207,6 +211,14 @@ static void fd_set_nb(int fd)
 
 const size_t k_max_msg = 32 << 20; // likely larger than the kernel buffer
 
+// Define maximum allowed keys before eviction.
+static const size_t MAX_KEYS = 25000;
+
+// Set idle timeout and connection limits
+const uint64_t k_idle_timeout_ms = 60 * 1000; // 60 seconds (was 5 seconds)
+const size_t MAX_ACTIVE_CONNS = 8000;         // Limit maximum active connections
+const int MAX_CONN_PER_SEC = 1000;            // Maximum new connections per second
+
 // remove from the front
 static void buf_consume(Buffer &buf, size_t n)
 {
@@ -241,6 +253,50 @@ static struct
     // the thread pool
     TheadPool thread_pool;
 } g_data;
+
+// Add forward declaration for hnode_same() so it can be used in evict_keys().
+static bool hnode_same(HNode *node, HNode *key);
+
+static void evict_keys()
+{
+    size_t current = hm_size(&g_data.db);
+    if (current <= MAX_KEYS)
+        return;
+    size_t num_to_evict = current / 10; // evict 10%
+    std::vector<Entry *> candidates;
+    candidates.reserve(current);
+
+    // Callback to collect all entries.
+    auto collect_cb = [](HNode *node, void *arg) -> bool
+    {
+        std::vector<Entry *> *vec = (std::vector<Entry *> *)arg;
+        Entry *ent = container_of(node, Entry, node);
+        vec->push_back(ent);
+        return true;
+    };
+    hm_foreach(&g_data.db, collect_cb, &candidates);
+
+    // Sort candidates by last_access (oldest first).
+    std::sort(candidates.begin(), candidates.end(), [](Entry *a, Entry *b)
+              { return a->last_access < b->last_access; });
+
+    for (size_t i = 0; i < num_to_evict && i < candidates.size(); i++)
+    {
+        Entry *ent = candidates[i];
+        // Use forward-declared hnode_same
+        HNode *node = hm_delete(&g_data.db, &ent->node, &hnode_same);
+        if (node)
+        {
+            entry_del(ent);
+        }
+    }
+}
+
+// Ensure hnode_same is defined
+static bool hnode_same(HNode *node, HNode *key)
+{
+    return node == key;
+}
 
 // Forward declarations for functions used by HTTP handlers.
 static void do_get(std::vector<std::string> &cmd, Buffer &out);
@@ -350,6 +406,12 @@ static bool try_one_http_request(Conn *conn)
                                      (const uint8_t *)"\r\n\r\n", (const uint8_t *)"\r\n\r\n" + 4);
     if (header_end_it == conn->incoming.end())
     {
+        // Check for potential overrun - if incoming buffer is too large but no header end found
+        if (conn->incoming.size() > 8192)
+        { // 8KB is reasonable for HTTP headers
+            conn->want_close = true;
+            return false; // Invalid request, force close
+        }
         return false; // Incomplete header
     }
     size_t header_end = std::distance(conn->incoming.begin(), header_end_it) + 4;
@@ -363,20 +425,21 @@ static bool try_one_http_request(Conn *conn)
         std::string line;
         while (std::getline(hs, line))
         {
-            if (line.find("Content-Length:") != std::string::npos)
+            // Remove carriage return if present
+            if (!line.empty() && line.back() == '\r')
             {
-                // e.g., "Content-Length: 42"
-                size_t colon = line.find(":");
-                if (colon != std::string::npos)
+                line.pop_back();
+            }
+
+            if (line.find("Content-Length:") == 0)
+            {
+                try
                 {
-                    try
-                    {
-                        content_length = std::stoul(line.substr(colon + 1));
-                    }
-                    catch (...)
-                    {
-                        content_length = 0;
-                    }
+                    content_length = std::stoul(line.substr(16)); // Skip "Content-Length: "
+                }
+                catch (...)
+                {
+                    content_length = 0;
                 }
             }
         }
@@ -387,6 +450,12 @@ static bool try_one_http_request(Conn *conn)
     {
         if (conn->incoming.size() < header_end + content_length)
         {
+            // Check for potential abuse - if content length is too large
+            if (content_length > 1024 * 1024)
+            { // 1MB max
+                conn->want_close = true;
+                return false; // Invalid request, force close
+            }
             return false; // wait for the full body
         }
     }
@@ -412,16 +481,15 @@ static void do_get(std::vector<std::string> &cmd, Buffer &out)
     HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
     if (!node)
     {
-        // Leave 'out' empty so that handle_http_request returns a "Key not found" JSON error.
         return;
     }
     Entry *ent = container_of(node, Entry, node);
     if (ent->type != T_STR)
     {
-        // Treat non-string types as missing.
         return;
     }
-    // Append the plain text string value.
+    // Update access time.
+    ent->last_access = get_monotonic_msec();
     buf_append(out, (const uint8_t *)ent->str.data(), ent->str.size());
 }
 
@@ -439,6 +507,8 @@ static void do_set(std::vector<std::string> &cmd, Buffer &out)
             out.push_back(TAG_ERR);
             return;
         }
+        // Update access time and value.
+        ent->last_access = get_monotonic_msec();
         ent->str.swap(cmd[2]);
     }
     else
@@ -447,15 +517,54 @@ static void do_set(std::vector<std::string> &cmd, Buffer &out)
         ent->key.swap(key.key);
         ent->node.hcode = key.node.hcode;
         ent->str.swap(cmd[2]);
+        ent->last_access = get_monotonic_msec();
         hm_insert(&g_data.db, &ent->node);
+        // Trigger eviction if needed.
+        evict_keys();
     }
-    // Return nil to indicate success.
     out.push_back(TAG_NIL);
 }
 
 // application callback when the listening socket is ready
 static int32_t handle_accept(int fd)
 {
+    // Implement connection rate limiting
+    static uint64_t last_check_time = 0;
+    static int connections_since_last_check = 0;
+
+    uint64_t now = get_monotonic_msec();
+
+    // Reset counter every second
+    if (now - last_check_time > 1000)
+    {
+        last_check_time = now;
+        connections_since_last_check = 0;
+    }
+
+    connections_since_last_check++;
+
+    // Count active connections
+    size_t active_conns = 0;
+    for (Conn *conn : g_data.fd2conn)
+    {
+        if (conn)
+            active_conns++;
+    }
+
+    // Apply rate limiting
+    if (connections_since_last_check > MAX_CONN_PER_SEC || active_conns >= MAX_ACTIVE_CONNS)
+    {
+        // Too many connections - silently refuse but don't report as error
+        struct sockaddr_in client_addr = {};
+        socklen_t addrlen = sizeof(client_addr);
+        int connfd = accept(fd, (struct sockaddr *)&client_addr, &addrlen);
+        if (connfd >= 0)
+        {
+            close(connfd); // Close immediately
+        }
+        return 0;
+    }
+
     // accept
     struct sockaddr_in client_addr = {};
     socklen_t addrlen = sizeof(client_addr);
@@ -472,6 +581,20 @@ static int32_t handle_accept(int fd)
 
     // set the new connection fd to nonblocking mode
     fd_set_nb(connfd);
+
+    // Add socket options for better connection handling
+    int val = 1;
+    setsockopt(connfd, SOL_SOCKET, SO_KEEPALIVE, &val, sizeof(val));
+    setsockopt(connfd, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val));
+    // Set TCP keepalive parameters
+    int idle = 60;
+    int intvl = 10;
+    int cnt = 5;
+    setsockopt(connfd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(connfd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(connfd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+    struct linger lg = {1, 0}; // Zero timeout - don't wait
+    setsockopt(connfd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
 
     // create a `struct Conn`
     Conn *conn = new Conn();
@@ -495,6 +618,11 @@ static void conn_destroy(Conn *conn)
     (void)close(conn->fd);
     g_data.fd2conn[conn->fd] = NULL;
     dlist_detach(&conn->idle_node);
+
+    // Clear buffers to free memory immediately
+    Buffer().swap(conn->incoming);
+    Buffer().swap(conn->outgoing);
+
     delete conn;
 }
 
@@ -904,60 +1032,18 @@ static void response_end(Buffer &out, size_t header)
     memcpy(&out[header], &len, 4);
 }
 
-// process 1 request if there is enough data
-static bool try_one_request(Conn *conn)
-{
-    // try to parse the protocol: message header
-    if (conn->incoming.size() < 4)
-    {
-        return false; // want read
-    }
-    uint32_t len = 0;
-    memcpy(&len, conn->incoming.data(), 4);
-    if (len > k_max_msg)
-    {
-        msg("too long");
-        conn->want_close = true;
-        return false; // want close
-    }
-    // message body
-    if (4 + len > conn->incoming.size())
-    {
-        return false; // want read
-    }
-    const uint8_t *request = &conn->incoming[4];
-
-    // got one request, do some application logic
-    std::vector<std::string> cmd;
-    if (parse_req(request, len, cmd) < 0)
-    {
-        msg("bad request");
-        conn->want_close = true;
-        return false; // want close
-    }
-    size_t header_pos = 0;
-    response_begin(conn->outgoing, &header_pos);
-    do_request(cmd, conn->outgoing);
-    response_end(conn->outgoing, header_pos);
-
-    // application logic done! remove the request message.
-    buf_consume(conn->incoming, 4 + len);
-    // Q: Why not just empty the buffer? See the explanation of "pipelining".
-    return true; // success
-}
-
 // application callback when the socket is writable
 static void handle_write(Conn *conn)
 {
     assert(conn->outgoing.size() > 0);
-    ssize_t rv = write(conn->fd, &conn->outgoing[0], conn->outgoing.size());
+    ssize_t rv = send(conn->fd, &conn->outgoing[0], conn->outgoing.size(), MSG_NOSIGNAL);
     if (rv < 0 && errno == EAGAIN)
     {
         return; // actually not ready
     }
     if (rv < 0)
     {
-        msg_errno("write() error");
+        msg_errno("send() error");
         conn->want_close = true; // error handling
         return;
     }
@@ -1024,8 +1110,6 @@ static void handle_read(Conn *conn)
     } // else: want read
 }
 
-const uint64_t k_idle_timeout_ms = 5 * 1000;
-
 static uint32_t next_timer_ms()
 {
     uint64_t now_ms = get_monotonic_msec();
@@ -1053,16 +1137,23 @@ static uint32_t next_timer_ms()
     return (int32_t)(next_ms - now_ms);
 }
 
-static bool hnode_same(HNode *node, HNode *key)
-{
-    return node == key;
-}
-
 static void process_timers()
 {
     uint64_t now_ms = get_monotonic_msec();
-    // idle timers using a linked list
-    while (!dlist_empty(&g_data.idle_list))
+
+    // Count active connections first
+    size_t active_conns = 0;
+    for (Conn *conn : g_data.fd2conn)
+    {
+        if (conn)
+            active_conns++;
+    }
+
+    // idle timers using a linked list - limit how many we close at once
+    const size_t max_close_per_cycle = 50; // Limit to 50 connections closed per event loop cycle
+    size_t closed_count = 0;
+
+    while (!dlist_empty(&g_data.idle_list) && closed_count < max_close_per_cycle)
     {
         Conn *conn = container_of(g_data.idle_list.next, Conn, idle_node);
         uint64_t next_ms = conn->last_active_ms + k_idle_timeout_ms;
@@ -1071,21 +1162,37 @@ static void process_timers()
             break; // not expired
         }
 
-        fprintf(stderr, "removing idle connection: %d\n", conn->fd);
-        conn_destroy(conn);
+        // Only remove truly idle connections
+        if (conn->incoming.size() == 0 && conn->outgoing.size() == 0)
+        {
+            fprintf(stderr, "removing idle connection: %d (active: %zu)\n", conn->fd, active_conns);
+            conn_destroy(conn);
+            closed_count++;
+            active_conns--;
+        }
+        else
+        {
+            // Connection has pending data, move to end of list and give it more time
+            dlist_detach(&conn->idle_node);
+            dlist_insert_before(&g_data.idle_list, &conn->idle_node);
+        }
     }
+
     // TTL timers using a heap
     const size_t k_max_works = 2000;
     size_t nworks = 0;
-    const std::vector<HeapItem> &heap = g_data.heap;
-    while (!heap.empty() && heap[0].val < now_ms)
+    while (!g_data.heap.empty() && g_data.heap[0].val < now_ms)
     {
-        Entry *ent = container_of(heap[0].ref, Entry, heap_idx);
+        Entry *ent = container_of(g_data.heap[0].ref, Entry, heap_idx);
         HNode *node = hm_delete(&g_data.db, &ent->node, &hnode_same);
         assert(node == &ent->node);
-        // fprintf(stderr, "key expired: %s\n", ent->key.c_str());
-        // delete the key
+
+        // Delete the heap entry properly
+        heap_delete(g_data.heap, 0);
+
+        // Delete the key
         entry_del(ent);
+
         if (nworks++ >= k_max_works)
         {
             // don't stall the server if too many keys are expiring at once
@@ -1096,6 +1203,8 @@ static void process_timers()
 
 int main()
 {
+    signal(SIGPIPE, SIG_IGN); // ignore SIGPIPE to prevent connection reset errors
+
     // initialization
     dlist_init(&g_data.idle_list);
     thread_pool_init(&g_data.thread_pool, 4);
@@ -1180,40 +1289,59 @@ int main()
 
         // handle connection sockets
         for (size_t i = 1; i < poll_args.size(); ++i)
-        { // note: skip the 1st
+        {
             uint32_t ready = poll_args[i].revents;
             if (ready == 0)
             {
                 continue;
             }
-            Conn *conn = g_data.fd2conn[poll_args[i].fd];
+
+            int fd = poll_args[i].fd;
+            if (fd >= (int)g_data.fd2conn.size() || !g_data.fd2conn[fd])
+            {
+                // Skip invalid fd (this can happen if a connection was closed)
+                continue;
+            }
+
+            Conn *conn = g_data.fd2conn[fd];
 
             // update the idle timer by moving conn to the end of the list
             conn->last_active_ms = get_monotonic_msec();
             dlist_detach(&conn->idle_node);
             dlist_insert_before(&g_data.idle_list, &conn->idle_node);
 
+            // Check for errors first to avoid processing bad connections
+            if (ready & (POLLERR | POLLHUP | POLLNVAL))
+            {
+                conn_destroy(conn);
+                continue;
+            }
+
             // handle IO
             if (ready & POLLIN)
             {
-                assert(conn->want_read);
-                handle_read(conn); // application logic
+                if (conn->want_read)
+                {
+                    handle_read(conn); // application logic
+                }
             }
             if (ready & POLLOUT)
             {
-                assert(conn->want_write);
-                handle_write(conn); // application logic
+                if (conn->want_write)
+                {
+                    handle_write(conn); // application logic
+                }
             }
 
-            // close the socket from socket error or application logic
-            if ((ready & POLLERR) || conn->want_close)
+            // Check if the connection should be closed
+            if (conn->want_close)
             {
                 conn_destroy(conn);
             }
-        } // for each connection sockets
+        }
 
         // handle timers
         process_timers();
-    } // the event loop
+    }
     return 0;
 }
